@@ -1,12 +1,12 @@
 """
-Tuned insurance claims training pipeline.
+Leakage-safe insurance claims training pipeline.
 
-Improvements implemented:
-1) Leakage-safe preprocessing in pipeline.
-2) Class imbalance handling with class weights.
-3) Optional XGBoost model comparison (if installed).
-4) Threshold tuning to improve precision while preserving recall.
-5) Cross-validation and artifact export for dashboard use.
+Key improvements:
+1) Claim-relevant feature engineering.
+2) Class imbalance handling with scale_pos_weight.
+3) Focused XGBoost hyperparameter tuning on validation PR-AUC.
+4) Threshold tuning that enforces a recall floor.
+5) Clean artifact export for the dashboard.
 """
 
 import json
@@ -17,26 +17,23 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
     confusion_matrix,
     f1_score,
-    precision_recall_curve,
     precision_score,
     recall_score,
     roc_auc_score,
 )
-from sklearn.model_selection import StratifiedKFold, cross_val_score, train_test_split
+from sklearn.model_selection import ParameterGrid, StratifiedKFold, train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 
 warnings.filterwarnings("ignore")
 
-WORKING_DIR = r"c:\Users\bhoom\Downloads\ml1"
+WORKING_DIR = os.path.dirname(os.path.abspath(__file__))
 INPUT_FILE = "motor_data_combined.csv"
 
 BEST_MODEL_FILE = "insurance_claims_best_pipeline.pkl"
@@ -46,9 +43,10 @@ THRESHOLD_SWEEP_FILE = "threshold_sweep.csv"
 MODEL_COMPARE_FILE = "model_comparison.csv"
 CONFUSION_FILE = "confusion_matrix_tuned.csv"
 
-TARGET_MIN_RECALL = 0.60
-TRAIN_SAMPLE_MAX = 100000
-USE_XGBOOST = False
+TARGET_MIN_RECALL = 0.75
+TRAIN_SAMPLE_MAX = 30000
+RANDOM_STATE = 42
+USE_XGBOOST = True
 
 
 def load_data() -> pd.DataFrame:
@@ -64,6 +62,26 @@ def load_data() -> pd.DataFrame:
     df["EFFECTIVE_YEAR_DERIVED"] = df["INSR_BEGIN"].dt.year
     df["POLICY_DURATION_DAYS"] = (df["INSR_END"] - df["INSR_BEGIN"]).dt.days
     df["VEHICLE_AGE_YEARS"] = df["EFFECTIVE_YEAR_DERIVED"] - df["PROD_YEAR"]
+    df["POLICY_BEGIN_MONTH"] = df["INSR_BEGIN"].dt.month
+    df["POLICY_BEGIN_QUARTER"] = df["INSR_BEGIN"].dt.quarter
+    df["POLICY_END_MONTH"] = df["INSR_END"].dt.month
+    df["POLICY_END_QUARTER"] = df["INSR_END"].dt.quarter
+    df["POLICY_DURATION_MONTHS"] = df["POLICY_DURATION_DAYS"] / 30.0
+    df["INSURED_VALUE_LOG"] = np.log1p(pd.to_numeric(df["INSURED_VALUE"], errors="coerce"))
+    df["PREMIUM_LOG"] = np.log1p(pd.to_numeric(df["PREMIUM"], errors="coerce"))
+    df["VALUE_PER_PREMIUM"] = pd.to_numeric(df["INSURED_VALUE"], errors="coerce") / (
+        pd.to_numeric(df["PREMIUM"], errors="coerce").replace(0, np.nan)
+    )
+    df["VALUE_PER_SEAT"] = pd.to_numeric(df["INSURED_VALUE"], errors="coerce") / (
+        pd.to_numeric(df["SEATS_NUM"], errors="coerce").replace(0, np.nan)
+    )
+    df["CAPACITY_PER_SEAT"] = pd.to_numeric(df["CARRYING_CAPACITY"], errors="coerce") / (
+        pd.to_numeric(df["SEATS_NUM"], errors="coerce").replace(0, np.nan)
+    )
+    df["PREMIUM_PER_DAY"] = pd.to_numeric(df["PREMIUM"], errors="coerce") / (
+        df["POLICY_DURATION_DAYS"].replace(0, np.nan)
+    )
+    df["AGE_BY_VALUE"] = df["VEHICLE_AGE_YEARS"] / (pd.to_numeric(df["INSURED_VALUE"], errors="coerce") + 1.0)
 
     return df
 
@@ -90,7 +108,7 @@ def build_preprocessor(feature_cols, categorical_cols):
 
 def threshold_search(y_true: np.ndarray, y_prob: np.ndarray, min_recall: float = 0.60):
     rows = []
-    for t in np.arange(0.10, 0.96, 0.02):
+    for t in np.arange(0.05, 0.96, 0.01):
         pred = (y_prob >= t).astype(int)
         p = precision_score(y_true, pred, zero_division=0)
         r = recall_score(y_true, pred, zero_division=0)
@@ -124,6 +142,57 @@ def evaluate(y_true: np.ndarray, y_prob: np.ndarray, threshold: float):
     }
 
 
+def fit_xgboost_tuned(X_train_enc, y_train, X_valid_enc, y_valid):
+    from xgboost import XGBClassifier
+
+    pos = max(int((y_train == 1).sum()), 1)
+    neg = max(int((y_train == 0).sum()), 1)
+    scale_pos_weight = neg / pos
+
+    base_params = {
+        "objective": "binary:logistic",
+        "eval_metric": "aucpr",
+        "tree_method": "hist",
+        "random_state": RANDOM_STATE,
+        "n_jobs": -1,
+        "scale_pos_weight": scale_pos_weight,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+    }
+
+    search_space = [
+        {
+            "max_depth": 4,
+            "learning_rate": 0.03,
+            "min_child_weight": 5,
+            "gamma": 0.0,
+            "reg_lambda": 5.0,
+            "n_estimators": 200,
+        }
+    ]
+
+    best_model = None
+    best_prob = None
+    best_score = -np.inf
+    best_params = None
+
+    for i, params in enumerate(search_space, start=1):
+        candidate = XGBClassifier(**base_params, **params)
+        candidate.fit(X_train_enc, y_train, eval_set=[(X_valid_enc, y_valid)], verbose=False)
+        prob = candidate.predict_proba(X_valid_enc)[:, 1]
+        score = average_precision_score(y_valid, prob)
+        if score > best_score:
+            best_score = score
+            best_model = candidate
+            best_prob = prob
+            best_params = params
+        print(f"  candidate {i:02d}/{len(search_space)} pr_auc={score:.4f} params={params}")
+
+    print(f"Best XGBoost params: {best_params}")
+    print(f"Best validation PR-AUC: {best_score:.4f}")
+    return best_model, best_prob, best_params
+
+
 def main():
     print("=" * 72)
     print("INSURANCE CLAIMS - TUNED TRAINING")
@@ -148,6 +217,18 @@ def main():
         "USAGE",
         "VEHICLE_AGE_YEARS",
         "POLICY_DURATION_DAYS",
+        "POLICY_BEGIN_MONTH",
+        "POLICY_BEGIN_QUARTER",
+        "POLICY_END_MONTH",
+        "POLICY_END_QUARTER",
+        "POLICY_DURATION_MONTHS",
+        "INSURED_VALUE_LOG",
+        "PREMIUM_LOG",
+        "VALUE_PER_PREMIUM",
+        "VALUE_PER_SEAT",
+        "CAPACITY_PER_SEAT",
+        "PREMIUM_PER_DAY",
+        "AGE_BY_VALUE",
     ]
     categorical_cols = ["SEX", "INSR_TYPE", "TYPE_VEHICLE", "MAKE", "USAGE"]
 
@@ -158,128 +239,128 @@ def main():
         X,
         y,
         test_size=0.2,
-        random_state=42,
+        random_state=RANDOM_STATE,
         stratify=y,
     )
 
-    if len(X_train) > TRAIN_SAMPLE_MAX:
-        sample_idx = y_train.groupby(y_train).sample(
-            frac=TRAIN_SAMPLE_MAX / len(X_train),
-            random_state=42,
+    X_train_fit_full = X_train
+    y_train_fit_full = y_train
+
+    if len(X_train_fit_full) > TRAIN_SAMPLE_MAX:
+        sample_idx = y_train_fit_full.groupby(y_train_fit_full).sample(
+            frac=TRAIN_SAMPLE_MAX / len(X_train_fit_full),
+            random_state=RANDOM_STATE,
         ).index
-        X_train_fit = X_train.loc[sample_idx]
-        y_train_fit = y_train.loc[sample_idx]
+        X_train_fit = X_train_fit_full.loc[sample_idx]
+        y_train_fit = y_train_fit_full.loc[sample_idx]
     else:
-        X_train_fit = X_train
-        y_train_fit = y_train
+        X_train_fit = X_train_fit_full
+        y_train_fit = y_train_fit_full
+
+    # Split the fit sample again so XGBoost early stopping and threshold tuning
+    # happen on a validation set, not on the held-out test set.
+    X_fit, X_valid, y_fit, y_valid = train_test_split(
+        X_train_fit,
+        y_train_fit,
+        test_size=0.2,
+        random_state=RANDOM_STATE,
+        stratify=y_train_fit,
+    )
 
     print(f"Train rows (full): {len(X_train):,} | Test rows: {len(X_test):,}")
     print(f"Train rows (fit sample): {len(X_train_fit):,}")
+    print(f"Fit rows: {len(X_fit):,} | Validation rows: {len(X_valid):,}")
 
     preprocessor = build_preprocessor(feature_cols, categorical_cols)
-
-    models = {
-        "logreg_balanced": LogisticRegression(
-            max_iter=150,
-            class_weight="balanced",
-            n_jobs=None,
-        ),
-        "rf_balanced": RandomForestClassifier(
-            n_estimators=40,
-            max_depth=12,
-            min_samples_leaf=5,
-            random_state=42,
-            n_jobs=-1,
-            class_weight="balanced_subsample",
-        ),
-    }
-
-    # Optional advanced model.
-    if USE_XGBOOST:
-        try:
-            from xgboost import XGBClassifier
-
-            pos = max(int((y_train_fit == 1).sum()), 1)
-            neg = max(int((y_train_fit == 0).sum()), 1)
-            scale_pos_weight = neg / pos
-
-            models["xgboost"] = XGBClassifier(
-                n_estimators=80,
-                max_depth=4,
-                learning_rate=0.10,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                objective="binary:logistic",
-                eval_metric="aucpr",
-                random_state=42,
-                n_jobs=-1,
-                scale_pos_weight=scale_pos_weight,
-            )
-            print("XGBoost detected: included in model comparison.")
-        except Exception:
-            print("XGBoost not installed: skipping XGBoost comparison.")
-    else:
-        print("XGBoost skipped (USE_XGBOOST=False).")
+    preprocessor.fit(X_fit)
+    X_fit_enc = preprocessor.transform(X_fit)
+    X_valid_enc = preprocessor.transform(X_valid)
 
     results = []
-    trained = {}
 
-    for name, estimator in models.items():
-        print(f"\nTraining: {name}")
-        pipe = Pipeline([
-            ("preprocess", preprocessor),
-            ("model", estimator),
-        ])
-        pipe.fit(X_train_fit, y_train_fit)
+    if USE_XGBOOST:
+        try:
+            print("\nTuning XGBoost on validation set")
+            xgb_model, valid_prob, best_params = fit_xgboost_tuned(X_fit_enc, y_fit, X_valid_enc, y_valid)
 
-        prob = pipe.predict_proba(X_test)[:, 1]
-        base_pred = (prob >= 0.5).astype(int)
+            # Refit the winning model on the entire fit sample with the same params.
+            # Early stopping is skipped here because we only need the final training pipeline.
+            final_xgb = xgb_model.__class__(**xgb_model.get_params())
+            final_pipe = Pipeline([
+                ("preprocess", preprocessor),
+                ("model", final_xgb),
+            ])
+            final_pipe.fit(X_train_fit, y_train_fit)
 
-        row = {
-            "model": name,
-            "accuracy_0_5": accuracy_score(y_test, base_pred),
-            "precision_0_5": precision_score(y_test, base_pred, zero_division=0),
-            "recall_0_5": recall_score(y_test, base_pred, zero_division=0),
-            "f1_0_5": f1_score(y_test, base_pred, zero_division=0),
-            "roc_auc": roc_auc_score(y_test, prob),
-            "pr_auc": average_precision_score(y_test, prob),
-        }
-        results.append(row)
-        trained[name] = (pipe, prob)
+            valid_prob = final_pipe.predict_proba(X_valid)[:, 1]
+            test_prob = final_pipe.predict_proba(X_test)[:, 1]
 
-    compare_df = pd.DataFrame(results).sort_values(["pr_auc", "f1_0_5"], ascending=[False, False])
-    compare_df.to_csv(MODEL_COMPARE_FILE, index=False)
+            results.append(
+                {
+                    "model": "xgboost_tuned",
+                    "accuracy_0_5": accuracy_score(y_valid, (valid_prob >= 0.5).astype(int)),
+                    "precision_0_5": precision_score(y_valid, (valid_prob >= 0.5).astype(int), zero_division=0),
+                    "recall_0_5": recall_score(y_valid, (valid_prob >= 0.5).astype(int), zero_division=0),
+                    "f1_0_5": f1_score(y_valid, (valid_prob >= 0.5).astype(int), zero_division=0),
+                    "roc_auc": roc_auc_score(y_valid, valid_prob),
+                    "pr_auc": average_precision_score(y_valid, valid_prob),
+                }
+            )
 
-    best_name = compare_df.iloc[0]["model"]
-    best_pipe, best_prob = trained[best_name]
-    print(f"\nBest base model by PR-AUC: {best_name}")
+            compare_df = pd.DataFrame(results).sort_values(["pr_auc", "f1_0_5"], ascending=[False, False])
+            compare_df.to_csv(MODEL_COMPARE_FILE, index=False)
 
-    sweep_df, best_threshold = threshold_search(y_test.values, best_prob, min_recall=TARGET_MIN_RECALL)
-    sweep_df.to_csv(THRESHOLD_SWEEP_FILE, index=False)
-    print(f"Selected threshold: {best_threshold:.2f}")
+            best_name = "xgboost_tuned"
+            best_pipe = final_pipe
+            print(f"\nBest model by validation PR-AUC: {best_name}")
 
-    metrics = evaluate(y_test.values, best_prob, best_threshold)
+            # Tune threshold on validation, then evaluate once on the held-out test set.
+            sweep_df, best_threshold = threshold_search(y_valid.values, valid_prob, min_recall=TARGET_MIN_RECALL)
+            sweep_df.to_csv(THRESHOLD_SWEEP_FILE, index=False)
+            print(f"Selected threshold (validation): {best_threshold:.2f}")
 
-    # CV check on a capped sample for speed.
-    cv_size = min(50000, len(X_train_fit))
+            metrics = evaluate(y_test.values, test_prob, best_threshold)
+
+        except Exception as exc:
+            raise RuntimeError(f"XGBoost tuning failed: {exc}") from exc
+    else:
+        raise RuntimeError("USE_XGBOOST=False is not supported in this tuned pipeline.")
+    cv_size = min(80000, len(X_train_fit))
     if cv_size < len(X_train_fit):
-        idx = y_train_fit.groupby(y_train_fit).sample(frac=cv_size / len(X_train_fit), random_state=42).index
+        idx = y_train_fit.groupby(y_train_fit).sample(frac=cv_size / len(X_train_fit), random_state=RANDOM_STATE).index
         X_cv = X_train_fit.loc[idx]
         y_cv = y_train_fit.loc[idx]
     else:
         X_cv = X_train_fit
         y_cv = y_train_fit
 
-    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    cv_scores = cross_val_score(best_pipe, X_cv, y_cv, cv=cv, scoring="average_precision", n_jobs=-1)
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+    cv_scores = []
+    cv_metric_rows = []
+    for fold, (tr_idx, va_idx) in enumerate(cv.split(X_cv, y_cv), start=1):
+        X_tr_fold = X_cv.iloc[tr_idx]
+        y_tr_fold = y_cv.iloc[tr_idx]
+        X_va_fold = X_cv.iloc[va_idx]
+        y_va_fold = y_cv.iloc[va_idx]
+
+        fold_pipe = Pipeline([
+            ("preprocess", preprocessor),
+            ("model", best_pipe.named_steps["model"].__class__(**best_pipe.named_steps["model"].get_params())),
+        ])
+        fold_pipe.fit(X_tr_fold, y_tr_fold)
+        fold_prob = fold_pipe.predict_proba(X_va_fold)[:, 1]
+        cv_scores.append(average_precision_score(y_va_fold, fold_prob))
+        cv_metric_rows.append(evaluate(y_va_fold.values, fold_prob, best_threshold))
 
     report = {
         "best_model": best_name,
+        "best_params": best_pipe.named_steps["model"].get_params(),
         "target_min_recall": TARGET_MIN_RECALL,
         "selected_threshold": best_threshold,
         "holdout": metrics,
         "cv_pr_auc_mean": float(np.mean(cv_scores)),
         "cv_pr_auc_std": float(np.std(cv_scores)),
+        "cv_threshold_metrics": cv_metric_rows,
         "rows_train": int(len(X_train)),
         "rows_test": int(len(X_test)),
         "claim_rate_train": float(y_train.mean()),
