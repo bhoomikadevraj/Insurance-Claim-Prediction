@@ -1,0 +1,30 @@
+{
+  "best_model": "rf_balanced",
+  "target_min_recall": 0.6,
+  "selected_threshold": 0.6,
+  "holdout": {
+    "threshold": 0.6,
+    "accuracy": 0.7462648408660082,
+    "precision": 0.1717726793973531,
+    "recall": 0.6240745362282673,
+    "f1": 0.26939581650058353,
+    "roc_auc": 0.779267956023761,
+    "pr_auc": 0.19551267190379235,
+    "confusion_matrix": [
+      [
+        112175,
+        36172
+      ],
+      [
+        4519,
+        7502
+      ]
+    ]
+  },
+  "cv_pr_auc_mean": 0.19314014018099585,
+  "cv_pr_auc_std": 0.012462805614515616,
+  "rows_train": 641470,
+  "rows_test": 160368,
+  "claim_rate_train": 0.07495751944751898,
+  "claim_rate_test": 0.07495884465728823
+}
